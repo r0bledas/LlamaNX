@@ -269,7 +269,7 @@ namespace {
         llama_log_set(log_cb, nullptr);
 
         llama_model_params mp = llama_model_default_params();
-        mp.use_mmap = false;
+        mp.load_mode = LLAMA_LOAD_MODE_NONE;
 
         llama_model* model = llama_model_load_from_file(model_path.c_str(), mp);
         if (!model) {

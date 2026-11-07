@@ -10,8 +10,7 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 $WORKSPACE = (Get-Location).Path -replace '\\', '/'
 Write-Host "Building LlamaNX inside devkitpro/devkita64 container..." -ForegroundColor Green
 
-docker run --rm -v "${WORKSPACE}:/workspace" -w /workspace devkitpro/devkita64 /bin/bash -c @"
-set -e
+docker run --rm -v "${WORKSPACE}:/workspace" -w /workspace devkitpro/devkita64 /bin/bash -c "set -e
 git config --global --add safe.directory /workspace
 git config --global --add safe.directory /workspace/vendor/llama.cpp
 
@@ -21,11 +20,10 @@ chmod +x scripts/build-llama.sh
 
 echo '==> 2. Compiling LlamaNX homebrew (.nro)...'
 make clean
-make -j\$(nproc)
+make -j4
 
 echo '==> Build Complete!'
-ls -lh LlamaNX.nro
-"@
+ls -lh LlamaNX.nro"
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "`nSuccessfully compiled LlamaNX.nro!" -ForegroundColor Green

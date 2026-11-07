@@ -1,4 +1,4 @@
-set -euo pipefail
+set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LLAMA="$ROOT/vendor/llama.cpp"
