@@ -15,6 +15,11 @@
 #include <gguf.h>
 #include <llama.h>
 
+extern "C" {
+    extern char* fake_heap_start;
+    extern char* fake_heap_end;
+}
+
 namespace {
     constexpr const char* MODEL_DIR_1 = "sdmc:/switch/llamanx";
     constexpr const char* MODEL_DIR_2 = "sdmc:/switch/chatnx";
@@ -87,15 +92,20 @@ namespace {
         return t == AppletType_Application || t == AppletType_SystemApplication;
     }
 
-    u64 free_ram() {
-        u64 total = 0, used = 0;
+    // Accurate heap inspection from Newlib fake_heap boundaries
+    u64 get_heap_total_bytes() {
+        if (fake_heap_start && fake_heap_end && fake_heap_end > fake_heap_start) {
+            return (u64)(fake_heap_end - fake_heap_start);
+        }
+        // Fallback to svcGetInfo
+        u64 total = 0;
         svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
-        svcGetInfo(&used,  InfoType_UsedMemorySize,  CUR_PROCESS_HANDLE, 0);
-        return total > used ? total - used : 0;
+        return total;
     }
 
     void log_cb(ggml_log_level level, const char* text, void*) {
-        if (level == GGML_LOG_LEVEL_ERROR) {
+        // Print errors and warnings to Switch screen console
+        if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN) {
             printf("%s", text);
             consoleUpdate(NULL);
         }
@@ -262,18 +272,22 @@ namespace {
 
     bool run_chat(PadState* pad, const std::string& model_path) {
         consoleClear();
-        printf("Loading %s ...\n", model_path.c_str());
+        printf("Initializing llama backend...\n");
+        printf("Loading: %s\n", model_path.c_str());
         consoleUpdate(NULL);
 
         llama_backend_init();
         llama_log_set(log_cb, nullptr);
 
         llama_model_params mp = llama_model_default_params();
-        mp.load_mode = LLAMA_LOAD_MODE_NONE;
+        mp.load_mode = LLAMA_LOAD_MODE_NONE; // standard buffered fread into heap
 
         llama_model* model = llama_model_load_from_file(model_path.c_str(), mp);
         if (!model) {
-            printf("\x1b[1;31mFailed to load model\x1b[0m\n");
+            printf("\n\x1b[1;31m[ERROR] Failed to load model from file.\x1b[0m\n");
+            printf("Path: %s\n", model_path.c_str());
+            printf("Make sure the model fits within Switch RAM (<2.8GB) and is not corrupt.\n");
+            wait_for_exit(pad);
             return false;
         }
 
@@ -285,7 +299,8 @@ namespace {
         llama_context* ctx = llama_init_from_model(model, cp);
         if (!ctx) {
             llama_model_free(model);
-            printf("\x1b[1;31mFailed to create context\x1b[0m\n");
+            printf("\n\x1b[1;31m[ERROR] Failed to create llama context\x1b[0m\n");
+            wait_for_exit(pad);
             return false;
         }
 
@@ -368,18 +383,18 @@ int main(int argc, char* argv[]) {
 
     while (appletMainLoop()) {
         consoleClear();
-        u64 ram_mb = free_ram() / (1024 * 1024);
+        u64 heap_mb = get_heap_total_bytes() / (1024 * 1024);
         std::string ip = NetworkManager::getLocalIP();
 
         printf("\x1b[1;35m====================================================\x1b[0m\n");
-        printf("\x1b[1;37m                   LLAMANX v1.1.0                   \x1b[0m\n");
+        printf("\x1b[1;37m                   LLAMANX v1.1.1                   \x1b[0m\n");
         printf("\x1b[2;37m      Forked from ChatNX by Souldbminer             \x1b[0m\n");
         printf("\x1b[1;35m====================================================\x1b[0m\n\n");
-        printf("Available Memory: \x1b[1;32m%llu MB\x1b[0m\n", (unsigned long long)ram_mb);
-        printf("Network IP:       \x1b[1;33m%s\x1b[0m\n\n", ip.c_str());
+        printf("Available App Heap: \x1b[1;32m%llu MB\x1b[0m\n", (unsigned long long)heap_mb);
+        printf("Network IP:         \x1b[1;33m%s\x1b[0m\n\n", ip.c_str());
         printf("Select Operation Mode:\n\n");
         printf("  \x1b[1;32m[A]\x1b[0m  Local Interactive Chat (On-Screen Keyboard)\n");
-        printf("  \x1b[1;33m[Y]\x1b[0m  HTTP Server API (:8080 - OpenAI Endpoint)\n");
+        printf("  \x1b[1;33m[Y]\x1b[0m  HTTP Server API (:8080 - Web UI & Remote)\n");
         printf("  \x1b[1;36m[X]\x1b[0m  Distributed RPC Node (:50052 - GGML PC Offload)\n\n");
         printf("  \x1b[1;31m[+]\x1b[0m  Exit to Homebrew Launcher\n\n");
         printf("----------------------------------------------------\n");
@@ -411,22 +426,11 @@ int main(int argc, char* argv[]) {
 
         if (kDown & HidNpadButton_Y) {
             std::vector<ModelEntry> models = scan_all_models();
-            if (models.empty()) {
-                consoleClear();
-                printf("\x1b[1;31mNo GGUF models found for HTTP Server!\x1b[0m\n\n");
-                printf("Please copy .gguf files to sdmc:/switch/llamanx/\n");
-                wait_for_exit(&pad);
-                continue;
-            }
-            std::string model_path;
-            if (select_model(&pad, models, model_path) >= 0) {
-                run_http_server_mode(&pad, model_path, 8080);
-            }
+            std::string initial_model = models.empty() ? "" : models[0].path;
+            run_http_server_mode(&pad, initial_model, 8080);
         }
 
         if (kDown & HidNpadButton_X) {
-            // RPC node mode does not require an upfront model file on SD card
-            // because the host PC streams graph weights and tensors over the socket.
             run_rpc_server_mode(&pad, ip, 50052);
         }
     }
