@@ -37,15 +37,15 @@ include $(DEVKITPRO)/libnx/switch_rules
 #   of a homebrew executable (.nro). This is intended to be used for sysmodules.
 #   NACP building is skipped as well.
 #---------------------------------------------------------------------------------
-TARGET		:=	ChatNX
+TARGET		:=	LlamaNX
 BUILD		:=	build
 SOURCES		:=	source
 DATA		:=	data
 INCLUDES	:=	include
 #ROMFS	:=	romfs
 
-APP_TITLE	:=	ChatNX
-APP_AUTHOR	:=	Souldbminer
+APP_TITLE	:=	LlamaNX
+APP_AUTHOR	:=	Souldbminer & LlamaNX
 
 #---------------------------------------------------------------------------------
 # options for code generation

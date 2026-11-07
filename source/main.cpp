@@ -1,3 +1,5 @@
+#include "modes.hpp"
+#include "network.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,7 +16,8 @@
 #include <llama.h>
 
 namespace {
-    constexpr const char* MODEL_DIR = "sdmc:/switch/chatnx";
+    constexpr const char* MODEL_DIR_1 = "sdmc:/switch/llamanx";
+    constexpr const char* MODEL_DIR_2 = "sdmc:/switch/chatnx";
 
     constexpr int N_CTX = 2048;
     constexpr int N_THREADS = 3;
@@ -72,6 +75,13 @@ namespace {
         return out;
     }
 
+    std::vector<ModelEntry> scan_all_models() {
+        std::vector<ModelEntry> models = list_models(MODEL_DIR_1);
+        std::vector<ModelEntry> legacy = list_models(MODEL_DIR_2);
+        models.insert(models.end(), legacy.begin(), legacy.end());
+        return models;
+    }
+
     bool is_application_mode() {
         AppletType t = appletGetAppletType();
         return t == AppletType_Application || t == AppletType_SystemApplication;
@@ -92,7 +102,7 @@ namespace {
     }
 
     void wait_for_exit(PadState* pad) {
-        printf("\nPress + to exit.\n");
+        printf("\nPress (+) to exit.\n");
         consoleUpdate(NULL);
         while (appletMainLoop()) {
             padUpdate(pad);
@@ -123,7 +133,7 @@ namespace {
         SwkbdConfig kbd;
         if (R_FAILED(swkbdCreate(&kbd, 0))) return false;
         swkbdConfigMakePresetDefault(&kbd);
-        swkbdConfigSetHeaderText(&kbd, "Enter your prompt");
+        swkbdConfigSetHeaderText(&kbd, "LlamaNX Prompt");
         swkbdConfigSetGuideText(&kbd, guide);
 
         char buf[1024] = {0};
@@ -138,232 +148,160 @@ namespace {
     struct ChatView {
         struct Line { std::string s; int len; };
         std::vector<Line> lines;
-        int  width  = 79;
-        int  height = 44;
-        int  scroll = 0;
-        bool follow = true;
-        std::string color;
+        int scroll = 0;
+        int max_visible = 38;
 
-        void init() {
-            PrintConsole* c = consoleGetDefault();
-            if (c->consoleWidth  > 1) width  = c->consoleWidth  - 1;
-            if (c->consoleHeight > 1) height = c->consoleHeight - 1;
-            lines.assign(1, { std::string(), 0 });
-            scroll = 0;
-            follow = true;
-            color.clear();
-        }
-
-        int max_scroll() const {
-            int m = (int)lines.size() - height;
-            return m > 0 ? m : 0;
-        }
-
-        void newline() { lines.push_back({ color, 0 }); }
+        void clear() { lines.clear(); scroll = 0; }
 
         void append(const std::string& text) {
-            for (size_t i = 0; i < text.size(); ) {
-                char ch = text[i];
-                if (ch == '\x1b') {
-                    std::string seq = "\x1b";
-                    size_t j = i + 1;
-                    if (j < text.size() && text[j] == '[') {
-                        seq += '['; ++j;
-                        while (j < text.size() && !(text[j] >= '@' && text[j] <= '~'))
-                            seq += text[j++];
-                        if (j < text.size()) seq += text[j++];
+            std::string cur;
+            int cur_len = 0;
+            for (size_t i = 0; i < text.size(); ++i) {
+                if (text[i] == '\x1b' && i + 1 < text.size() && text[i+1] == '[') {
+                    size_t j = i + 2;
+                    while (j < text.size() && text[j] != 'm') ++j;
+                    if (j < text.size()) {
+                        cur.append(text, i, j - i + 1);
+                        i = j;
+                        continue;
                     }
-                    if (!seq.empty() && seq.back() == 'm')
-                        color = (seq == "\x1b[0m" || seq == "\x1b[m") ? std::string() : seq;
-                    lines.back().s += seq;
-                    i = j;
-                } else if (ch == '\n') {
-                    newline();
-                    ++i;
-                } else if (ch == '\r') {
-                    ++i;
+                }
+                if (text[i] == '\n') {
+                    lines.push_back({ cur, cur_len });
+                    cur.clear();
+                    cur_len = 0;
                 } else {
-                    if (lines.back().len >= width) newline();
-                    lines.back().s += ch;
-                    lines.back().len += 1;
-                    ++i;
+                    cur.push_back(text[i]);
+                    cur_len++;
+                    if (cur_len >= 80) {
+                        lines.push_back({ cur, cur_len });
+                        cur.clear();
+                        cur_len = 0;
+                    }
                 }
             }
-            if (follow) scroll = max_scroll();
+            if (!cur.empty()) lines.push_back({ cur, cur_len });
+            to_bottom();
         }
 
-        void scroll_by(int d) {
-            int ns = scroll + d;
-            if (ns < 0) ns = 0;
-            if (ns > max_scroll()) ns = max_scroll();
-            scroll = ns;
-            follow = (scroll >= max_scroll());
+        void to_bottom() {
+            int n = (int)lines.size();
+            scroll = n > max_visible ? n - max_visible : 0;
         }
-
-        void to_bottom() { follow = true; scroll = max_scroll(); }
 
         void render() {
             consoleClear();
-            int total = (int)lines.size();
-            bool bar = total > height;
-            int thumb_pos = 0, thumb_size = height;
-            if (bar) {
-                thumb_size = height * height / total;
-                if (thumb_size < 1) thumb_size = 1;
-                int ms = max_scroll();
-                thumb_pos = ms > 0 ? scroll * (height - thumb_size) / ms : 0;
-            }
-            for (int r = 0; r < height; ++r) {
-                int idx = scroll + r;
-                printf("\x1b[%d;1H", r + 1);
-                if (idx < total) printf("%s\x1b[0m", lines[idx].s.c_str());
-                if (bar) {
-                    printf("\x1b[%d;%dH", r + 1, width + 1);
-                    bool thumb = (r >= thumb_pos && r < thumb_pos + thumb_size);
-                    printf(thumb ? "\x1b[7m \x1b[0m" : "\x1b[2m|\x1b[0m");
-                }
+            int n = (int)lines.size();
+            int end = scroll + max_visible;
+            if (end > n) end = n;
+            for (int i = scroll; i < end; ++i) {
+                printf("%s\n", lines[i].s.c_str());
             }
             consoleUpdate(NULL);
         }
-    };
+    } g_view;
 
-    ChatView g_view;
-
-    std::string generate(llama_context* ctx, const llama_vocab* vocab, llama_sampler* smpl,
-                         const std::string& prompt, PadState* pad) {
-        const bool is_first = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == -1;
-        std::vector<llama_token> toks = tokenize(vocab, prompt, is_first);
-        if (toks.empty()) return std::string();
-
-        llama_batch batch = llama_batch_get_one(toks.data(), (int32_t)toks.size());
-        std::string reply;
-        int n_gen = 0;
-        u64 t_start = armGetSystemTick();
-
-        for (int i = 0; i < N_PREDICT && appletMainLoop(); ++i) {
-            if (llama_decode(ctx, batch) != 0) break;
-
-            llama_token id = llama_sampler_sample(smpl, ctx, -1);
-            if (llama_vocab_is_eog(vocab, id)) break;
-
-            std::string piece = token_to_text(vocab, id);
-            reply += piece;
-            g_view.append(piece);
-            g_view.render();
-            ++n_gen;
-
-            static llama_token next;
-            next  = id;
-            batch = llama_batch_get_one(&next, 1);
-
-            padUpdate(pad);
-            if (padGetButtonsDown(pad) & HidNpadButton_B) {
-                g_view.append("\x1b[2;37m [cancelled]\x1b[0m");
-                break;
-            }
-        }
-
-        double secs = armTicksToNs(armGetSystemTick() - t_start) / 1.0e9;
-        if (n_gen > 0 && secs > 0.0) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "\n\x1b[2;37m%d tokens, %.2f/sec\x1b[0m\n", n_gen, n_gen / secs);
-            g_view.append(buf);
-            g_view.render();
-        }
-
-        return reply;
-    }
-
-    int select_model(PadState* pad, const std::vector<ModelEntry>& models, std::string& out_path) {
-        int sel = 0;
+    int select_model(PadState* pad, const std::vector<ModelEntry>& models, std::string& out) {
+        int selected = 0;
+        int n = (int)models.size();
         while (appletMainLoop()) {
             consoleClear();
-            printf("ChatNX - select a model\n\n");
-            for (int i = 0; i < (int)models.size(); ++i) {
-                double gib = models[i].size / (1024.0 * 1024.0 * 1024.0);
-                const char* arrow = (i == sel) ? "\x1b[1;36m> " : "    ";
-                printf("%s%s\x1b[0m  \x1b[2;37m[%s, %.2f GiB]\x1b[0m\n",
-                       arrow, models[i].name.c_str(), models[i].quant.c_str(), gib);
+            printf("\x1b[1;36m=== LlamaNX - Select GGUF Model ===\x1b[0m\n\n");
+            for (int i = 0; i < n; ++i) {
+                double mb = (double)models[i].size / (1024.0 * 1024.0);
+                if (i == selected) {
+                    printf("\x1b[7m > %s (%s, %.1f MB) \x1b[0m\n",
+                           models[i].name.c_str(), models[i].quant.c_str(), mb);
+                } else {
+                    printf("   %s (%s, %.1f MB)\n",
+                           models[i].name.c_str(), models[i].quant.c_str(), mb);
+                }
             }
-            printf("Press + to exit");
+            printf("\n\x1b[2;37m(Up/Down): Select | (A): Confirm | (+): Exit\x1b[0m\n");
             consoleUpdate(NULL);
 
             padUpdate(pad);
-            u64 k = padGetButtonsDown(pad);
-            if (k & HidNpadButton_Plus) return -1;
-            if (k & (HidNpadButton_Down | HidNpadButton_StickLDown))
-                sel = (sel + 1) % models.size();
-            if (k & (HidNpadButton_Up | HidNpadButton_StickLUp))
-                sel = (sel - 1 + (int)models.size()) % models.size();
-            if (k & HidNpadButton_A) {
-                out_path = models[sel].path;
-                return sel;
+            u64 kDown = padGetButtonsDown(pad);
+            if (kDown & HidNpadButton_Plus) return -1;
+            if ((kDown & HidNpadButton_Up)   && selected > 0)     selected--;
+            if ((kDown & HidNpadButton_Down) && selected + 1 < n) selected++;
+            if (kDown & HidNpadButton_A) {
+                out = models[selected].path;
+                return selected;
             }
         }
         return -1;
     }
 
+    std::string generate(llama_context* ctx, const llama_vocab* vocab, llama_sampler* smpl,
+                         const std::string& prompt, PadState* pad) {
+        std::vector<llama_token> tokens = tokenize(vocab, prompt, true);
+        llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
+        if (llama_decode(ctx, batch) != 0) return "[decode error]";
+
+        std::string full_response;
+        int n_cur = (int)tokens.size();
+        for (int i = 0; i < N_PREDICT; ++i) {
+            llama_token new_tok = llama_sampler_sample(smpl, ctx, -1);
+            if (llama_vocab_is_eog(vocab, new_tok)) break;
+
+            std::string piece = token_to_text(vocab, new_tok);
+            full_response += piece;
+            g_view.append(piece);
+            g_view.render();
+
+            batch = llama_batch_get_one(&new_tok, 1);
+            if (llama_decode(ctx, batch) != 0) break;
+            n_cur++;
+
+            padUpdate(pad);
+            if (padGetButtonsDown(pad) & HidNpadButton_B) break;
+        }
+        return full_response;
+    }
+
     bool run_chat(PadState* pad, const std::string& model_path) {
-        const double mib = 1024.0 * 1024.0;
-
-        llama_log_set(log_cb, nullptr);
-        llama_backend_init();
-
         consoleClear();
-        printf("Loading %s...\n", model_path.c_str());
+        printf("Loading %s ...\n", model_path.c_str());
         consoleUpdate(NULL);
 
+        llama_backend_init();
+        llama_log_set(log_cb, nullptr);
+
         llama_model_params mp = llama_model_default_params();
-        mp.n_gpu_layers = 0;
-        mp.use_mmap     = false;
-        mp.use_mlock    = false;
+        mp.use_mmap = false;
 
         llama_model* model = llama_model_load_from_file(model_path.c_str(), mp);
         if (!model) {
-            printf("Failed to load model.");
+            printf("\x1b[1;31mFailed to load model\x1b[0m\n");
+            return false;
+        }
+
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = N_CTX;
+        cp.n_threads = N_THREADS;
+        cp.n_threads_batch = N_THREADS;
+
+        llama_context* ctx = llama_init_from_model(model, cp);
+        if (!ctx) {
+            llama_model_free(model);
+            printf("\x1b[1;31mFailed to create context\x1b[0m\n");
             return false;
         }
 
         const llama_vocab* vocab = llama_model_get_vocab(model);
-        printf("Model loaded. Free heap: %.1f MiB\n", free_ram() / mib);
-        consoleUpdate(NULL);
-
-        llama_context_params cp = llama_context_default_params();
-        cp.n_ctx           = N_CTX;
-        cp.n_threads       = N_THREADS;
-        cp.n_threads_batch = N_THREADS;
-        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
-
-        llama_context* ctx = llama_init_from_model(model, cp);
-        if (!ctx) {
-            printf("Failed to create context.\n");
-            llama_model_free(model);
-            return false;
-        }
-
         llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-        // Prevemt repatition loop
-        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(64, 1.1f, 0.0f, 0.0f));
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.95f, 1));
         llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
-        llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+        llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
 
         const char* tmpl = llama_model_chat_template(model, nullptr);
-
         std::vector<llama_chat_message> messages;
-        std::vector<char> formatted(llama_n_ctx(ctx));
+        std::vector<char> formatted(4096);
         int prev_len = 0;
 
-        messages.push_back({ "system",
-            strdup("You are a helpful AI assistant. Answer the user's question directly in plain prose. "
-                   "Do not use markdown, code blocks, backticks, or bullet lists. "
-                   "Do not repeat the question back. Give a real answer in a few complete sentences."
-                   "If the data you are being questioned on is not in your training data or you are unsure about it, tell that to the user") });
-
-
-        g_view.init();
-        g_view.append("\x1b[2;37mPress A to enter a prompt and + to exit\x1b[0m\n");
+        g_view.clear();
+        g_view.append("\x1b[1;36m=== LlamaNX Local Chat ===\x1b[0m\n");
+        g_view.append("\x1b[2;37mPress A to type a prompt, B to stop generation, + to exit\x1b[0m\n");
         g_view.render();
 
         while (appletMainLoop()) {
@@ -371,55 +309,37 @@ namespace {
             u64 kDown = padGetButtonsDown(pad);
             if (kDown & HidNpadButton_Plus) break;
 
-            // Scroll the chat history with the D-pad or left stick (held = repeat).
-            u64 kHeld = padGetButtons(pad);
-            int prev_scroll = g_view.scroll;
-            if (kHeld & (HidNpadButton_Up   | HidNpadButton_StickLUp))   g_view.scroll_by(-1);
-            if (kHeld & (HidNpadButton_Down | HidNpadButton_StickLDown)) g_view.scroll_by(1);
+            if (kDown & HidNpadButton_A) {
+                std::string input;
+                if (read_line("Enter your prompt", input) && !input.empty()) {
+                    g_view.append("\n\x1b[1;33mYou:\x1b[0m " + input + "\n\x1b[1;36mAI:\x1b[0m ");
+                    g_view.render();
 
-            if (!(kDown & HidNpadButton_A)) {
-                if (g_view.scroll != prev_scroll) g_view.render();
-                else                              consoleUpdate(NULL);
-                continue;
+                    messages.push_back({ "user", strdup(input.c_str()) });
+
+                    int new_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(),
+                                                            true, formatted.data(), formatted.size());
+                    if (new_len > (int)formatted.size()) {
+                        formatted.resize(new_len);
+                        new_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(),
+                                                            true, formatted.data(), formatted.size());
+                    }
+                    if (new_len >= 0) {
+                        std::string prompt(formatted.begin() + prev_len, formatted.begin() + new_len);
+                        std::string reply = generate(ctx, vocab, smpl, prompt, pad);
+                        messages.push_back({ "assistant", strdup(reply.c_str()) });
+                        prev_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(),
+                                                             false, nullptr, 0);
+                        if (prev_len < 0) prev_len = 0;
+                    }
+                    g_view.append("\n\x1b[2;37mPress A for next prompt, + to exit\x1b[0m\n");
+                    g_view.render();
+                }
             }
-
-            std::string input;
-            if (!read_line("Message", input) || input.empty()) continue;
-
-            g_view.to_bottom();
-            char hdr[1100];
-            snprintf(hdr, sizeof(hdr), "\n\x1b[1;33mYou:\x1b[0m %s\n\x1b[1;36mAI:\x1b[0m ", input.c_str());
-            g_view.append(hdr);
-            g_view.render();
-
-            messages.push_back({ "user", strdup(input.c_str()) });
-
-            int new_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(),
-                                                    true, formatted.data(), formatted.size());
-            if (new_len > (int)formatted.size()) {
-                formatted.resize(new_len);
-                new_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(),
-                                                    true, formatted.data(), formatted.size());
-            }
-            if (new_len < 0) {
-                g_view.append("\x1b[1;31mError\x1b[0m\n");
-                g_view.render();
-                continue;
-            }
-
-            std::string prompt(formatted.begin() + prev_len, formatted.begin() + new_len);
-            std::string reply = generate(ctx, vocab, smpl, prompt, pad);
-
-            messages.push_back({ "assistant", strdup(reply.c_str()) });
-            prev_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(),
-                                                 false, nullptr, 0);
-            if (prev_len < 0) prev_len = 0;
-
-            g_view.append("\n\x1b[2;37mPress A to enter a prompt and + to exit\x1b[0m\n");
-            g_view.render();
+            consoleUpdate(NULL);
         }
 
-        for (llama_chat_message& m : messages) free((void*)m.content);
+        for (auto& m : messages) free((void*)m.content);
         llama_sampler_free(smpl);
         llama_free(ctx);
         llama_model_free(model);
@@ -436,34 +356,82 @@ int main(int argc, char* argv[]) {
     padInitializeDefault(&pad);
 
     if (!is_application_mode()) {
-        printf("Rerun in title takeover mode. Press + to exit.\n");
+        printf("\x1b[1;31m[LlamaNX ERROR]\x1b[0m\n");
+        printf("Applet mode detected (~450MB RAM limit).\n");
+        printf("Please launch in Title Override mode (Hold R while launching a game).\n");
         wait_for_exit(&pad);
         consoleExit(NULL);
         return 0;
     }
 
-    printf("ChatNX\nScanning %s ...\n", MODEL_DIR);
-    consoleUpdate(NULL);
+    NetworkManager::init();
 
-    std::vector<ModelEntry> models = list_models(MODEL_DIR);
-    if (models.empty()) {
-        printf("\x1b[1;31mNo models found.");
-        printf("Put .gguf files in %s\n", MODEL_DIR);
-        wait_for_exit(&pad);
-        consoleExit(NULL);
-        return 0;
+    while (appletMainLoop()) {
+        consoleClear();
+        u64 ram_mb = free_ram() / (1024 * 1024);
+        std::string ip = NetworkManager::getLocalIP();
+
+        printf("\x1b[1;35m====================================================\x1b[0m\n");
+        printf("\x1b[1;37m                   LLAMANX v1.1.0                   \x1b[0m\n");
+        printf("\x1b[2;37m      Forked from ChatNX by Souldbminer             \x1b[0m\n");
+        printf("\x1b[1;35m====================================================\x1b[0m\n\n");
+        printf("Available Memory: \x1b[1;32m%llu MB\x1b[0m\n", (unsigned long long)ram_mb);
+        printf("Network IP:       \x1b[1;33m%s\x1b[0m\n\n", ip.c_str());
+        printf("Select Operation Mode:\n\n");
+        printf("  \x1b[1;32m[A]\x1b[0m  Local Interactive Chat (On-Screen Keyboard)\n");
+        printf("  \x1b[1;33m[Y]\x1b[0m  HTTP Server API (:8080 - OpenAI Endpoint)\n");
+        printf("  \x1b[1;36m[X]\x1b[0m  Distributed RPC Node (:50052 - GGML PC Offload)\n\n");
+        printf("  \x1b[1;31m[+]\x1b[0m  Exit to Homebrew Launcher\n\n");
+        printf("----------------------------------------------------\n");
+        consoleUpdate(NULL);
+
+        padUpdate(&pad);
+        u64 kDown = padGetButtonsDown(&pad);
+
+        if (kDown & HidNpadButton_Plus) {
+            break;
+        }
+
+        if (kDown & HidNpadButton_A) {
+            std::vector<ModelEntry> models = scan_all_models();
+            if (models.empty()) {
+                consoleClear();
+                printf("\x1b[1;31mNo GGUF models found!\x1b[0m\n\n");
+                printf("Please copy .gguf files to:\n");
+                printf("  sdmc:/switch/llamanx/\n");
+                printf("  or sdmc:/switch/chatnx/\n");
+                wait_for_exit(&pad);
+                continue;
+            }
+            std::string model_path;
+            if (select_model(&pad, models, model_path) >= 0) {
+                run_chat(&pad, model_path);
+            }
+        }
+
+        if (kDown & HidNpadButton_Y) {
+            std::vector<ModelEntry> models = scan_all_models();
+            if (models.empty()) {
+                consoleClear();
+                printf("\x1b[1;31mNo GGUF models found for HTTP Server!\x1b[0m\n\n");
+                printf("Please copy .gguf files to sdmc:/switch/llamanx/\n");
+                wait_for_exit(&pad);
+                continue;
+            }
+            std::string model_path;
+            if (select_model(&pad, models, model_path) >= 0) {
+                run_http_server_mode(&pad, model_path, 8080);
+            }
+        }
+
+        if (kDown & HidNpadButton_X) {
+            // RPC node mode does not require an upfront model file on SD card
+            // because the host PC streams graph weights and tensors over the socket.
+            run_rpc_server_mode(&pad, ip, 50052);
+        }
     }
 
-    std::string model_path;
-    if (select_model(&pad, models, model_path) < 0) {
-        consoleExit(NULL);
-        return 0;
-    }
-
-    run_chat(&pad, model_path);
-
-    wait_for_exit(&pad);
-
+    NetworkManager::exit();
     consoleExit(NULL);
     return 0;
 }
