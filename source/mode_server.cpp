@@ -21,7 +21,19 @@
 #include <gguf.h>
 #include <llama.h>
 
+extern "C" {
+    extern char* fake_heap_start;
+    extern char* fake_heap_end;
+}
+
 namespace {
+    static void server_log_cb(ggml_log_level level, const char* text, void*) {
+        if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_INFO) {
+            printf("%s", text);
+            consoleUpdate(NULL);
+        }
+    }
+
     struct ServerConfig {
         std::string loaded_model_path;
         int n_ctx = 1024;
@@ -81,15 +93,18 @@ namespace {
         if (path.empty()) return false;
 
         llama_backend_init();
-        llama_model_params mp = llama_model_default_params();
-        mp.load_mode = LLAMA_LOAD_MODE_NONE; // standard buffered read (safe for FAT32 / libnx)
+        llama_log_set(server_log_cb, nullptr);
 
-        printf("[Web Server] Loading %s (ctx: %d, th: %d)...\n", path.c_str(), n_ctx, n_threads);
+        llama_model_params mp = llama_model_default_params();
+        mp.load_mode = LLAMA_LOAD_MODE_NONE; // standard buffered read into heap
+
+        printf("\n[Web Server] Loading %s (ctx: %d, th: %d)...\n", path.c_str(), n_ctx, n_threads);
         consoleUpdate(NULL);
 
         s_model = llama_model_load_from_file(path.c_str(), mp);
         if (!s_model) {
-            printf("[Web Server] Failed to load model\n");
+            printf("\x1b[1;31m[Web Server ERROR] llama_model_load_from_file returned NULL.\x1b[0m\n");
+            printf("Check logs above for specific failure reason.\n");
             consoleUpdate(NULL);
             return false;
         }
@@ -103,7 +118,7 @@ namespace {
         if (!s_ctx) {
             llama_model_free(s_model);
             s_model = nullptr;
-            printf("[Web Server] Failed to create context\n");
+            printf("\x1b[1;31m[Web Server ERROR] Failed to create llama context\x1b[0m\n");
             consoleUpdate(NULL);
             return false;
         }
@@ -112,7 +127,7 @@ namespace {
         s_cfg.loaded_model_path = path;
         s_cfg.n_ctx = n_ctx;
         s_cfg.n_threads = n_threads;
-        printf("[Web Server] Model loaded successfully!\n");
+        printf("\x1b[1;32m[Web Server] Model loaded successfully!\x1b[0m\n\n");
         consoleUpdate(NULL);
         return true;
     }
@@ -210,10 +225,6 @@ void run_http_server_mode(PadState* pad, const std::string& initial_model, int p
     printf("----------------------------------------------------\n");
     consoleUpdate(NULL);
 
-    if (!initial_model.empty()) {
-        load_model_instance(initial_model, s_cfg.n_ctx, s_cfg.n_threads);
-    }
-
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         printf("[ERROR] Failed to create socket\n");
@@ -267,13 +278,11 @@ void run_http_server_mode(PadState* pad, const std::string& initial_model, int p
                 std::string res_body;
 
                 if (req.rfind("GET / ", 0) == 0 || req.rfind("GET /index.html", 0) == 0) {
-                    // Serve embedded lightweight HTML5 Web Remote Control
                     res_body = INDEX_HTML;
                     res_header = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
                 } else if (req.rfind("GET /api/status", 0) == 0) {
-                    u64 total_ram = 0, used_ram = 0;
-                    svcGetInfo(&total_ram, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
-                    svcGetInfo(&used_ram,  InfoType_UsedMemorySize,  CUR_PROCESS_HANDLE, 0);
+                    u64 total_ram = (fake_heap_end && fake_heap_start) ? (u64)(fake_heap_end - fake_heap_start) : 0;
+                    u64 used_ram = s_model ? (s_cfg.n_ctx * 2 * 1024) : 0;
 
                     std::ostringstream json;
                     json << "{"
@@ -295,7 +304,6 @@ void run_http_server_mode(PadState* pad, const std::string& initial_model, int p
                     res_body = json.str();
                     res_header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
                 } else if (req.rfind("POST /api/config", 0) == 0) {
-                    // Simple parse of model path, context, threads
                     size_t body_pos = req.find("\r\n\r\n");
                     std::string body = (body_pos != std::string::npos) ? req.substr(body_pos + 4) : "";
 
@@ -320,13 +328,12 @@ void run_http_server_mode(PadState* pad, const std::string& initial_model, int p
 
                     bool ok = load_model_instance(target_model, n_ctx, th);
                     res_body = ok ? "{\"success\":true,\"message\":\"Model loaded successfully\"}"
-                                  : "{\"success\":false,\"message\":\"Failed to load model\"}";
+                                  : "{\"success\":false,\"message\":\"Failed to load model. Check Switch screen for error.\"}";
                     res_header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
                 } else if (req.rfind("POST /v1/chat/completions", 0) == 0) {
                     size_t body_pos = req.find("\r\n\r\n");
                     std::string body = (body_pos != std::string::npos) ? req.substr(body_pos + 4) : "";
 
-                    // Extract user message content
                     std::string prompt = "Hello";
                     size_t c_pos = body.find("\"content\":");
                     if (c_pos != std::string::npos) {
@@ -337,7 +344,7 @@ void run_http_server_mode(PadState* pad, const std::string& initial_model, int p
                         }
                     }
 
-                    printf("[Web] Generating response for: %s\n", prompt.c_str());
+                    printf("[Web] Prompt: %s\n", prompt.c_str());
                     consoleUpdate(NULL);
 
                     std::string answer = run_inference(prompt, s_cfg.n_predict, s_cfg.temp);
