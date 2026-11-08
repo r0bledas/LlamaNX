@@ -387,7 +387,7 @@ int main(int argc, char* argv[]) {
         std::string ip = NetworkManager::getLocalIP();
 
         printf("\x1b[1;35m====================================================\x1b[0m\n");
-        printf("\x1b[1;37m                   LLAMANX v1.1.4                   \x1b[0m\n");
+        printf("\x1b[1;37m                   LLAMANX v1.1.5                   \x1b[0m\n");
         printf("\x1b[2;37m      Forked from ChatNX by Souldbminer             \x1b[0m\n");
         printf("\x1b[1;35m====================================================\x1b[0m\n\n");
         printf("Available App Heap: \x1b[1;32m%llu MB\x1b[0m\n", (unsigned long long)heap_mb);

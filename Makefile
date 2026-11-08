@@ -46,7 +46,7 @@ INCLUDES	:=	include
 
 APP_TITLE	:=	LlamaNX
 APP_AUTHOR	:=	Souldbminer & LlamaNX
-APP_VERSION	:=	1.1.4
+APP_VERSION	:=	1.1.5
 
 #---------------------------------------------------------------------------------
 # options for code generation
