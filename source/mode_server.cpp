@@ -111,6 +111,8 @@ namespace {
 
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = n_ctx;
+        cp.n_batch = std::min<uint32_t>(n_ctx, 256);
+        cp.n_ubatch = 64;
         cp.n_threads = n_threads;
         cp.n_threads_batch = n_threads;
 
@@ -160,10 +162,13 @@ namespace {
         int got = llama_tokenize(s_vocab, prompt_str.c_str(), (int32_t)prompt_str.size(), tokens.data(), n_tokens, true, true);
         tokens.resize(got < 0 ? 0 : got);
 
-        llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
-        if (llama_decode(s_ctx, batch) != 0) {
-            llama_sampler_free(smpl);
-            return "[Error during initial decode]";
+        for (size_t b = 0; b < tokens.size(); b += 256) {
+            size_t chunk_len = std::min<size_t>(tokens.size() - b, 256);
+            llama_batch batch = llama_batch_get_one(tokens.data() + b, (int32_t)chunk_len);
+            if (llama_decode(s_ctx, batch) != 0) {
+                llama_sampler_free(smpl);
+                return "[Error during initial decode]";
+            }
         }
 
         std::string response;
@@ -175,7 +180,7 @@ namespace {
             int n = llama_token_to_piece(s_vocab, tok, buf, sizeof(buf), 0, true);
             if (n > 0) response.append(buf, n);
 
-            batch = llama_batch_get_one(&tok, 1);
+            llama_batch batch = llama_batch_get_one(&tok, 1);
             if (llama_decode(s_ctx, batch) != 0) break;
         }
 

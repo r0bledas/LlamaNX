@@ -246,8 +246,11 @@ namespace {
     std::string generate(llama_context* ctx, const llama_vocab* vocab, llama_sampler* smpl,
                          const std::string& prompt, PadState* pad) {
         std::vector<llama_token> tokens = tokenize(vocab, prompt, true);
-        llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
-        if (llama_decode(ctx, batch) != 0) return "[decode error]";
+        for (size_t b = 0; b < tokens.size(); b += 256) {
+            size_t chunk_len = std::min<size_t>(tokens.size() - b, 256);
+            llama_batch batch = llama_batch_get_one(tokens.data() + b, (int32_t)chunk_len);
+            if (llama_decode(ctx, batch) != 0) return "[decode error]";
+        }
 
         std::string full_response;
         int n_cur = (int)tokens.size();
@@ -260,7 +263,7 @@ namespace {
             g_view.append(piece);
             g_view.render();
 
-            batch = llama_batch_get_one(&new_tok, 1);
+            llama_batch batch = llama_batch_get_one(&new_tok, 1);
             if (llama_decode(ctx, batch) != 0) break;
             n_cur++;
 
@@ -293,6 +296,8 @@ namespace {
 
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = N_CTX;
+        cp.n_batch = 256;
+        cp.n_ubatch = 64;
         cp.n_threads = N_THREADS;
         cp.n_threads_batch = N_THREADS;
 
@@ -387,7 +392,7 @@ int main(int argc, char* argv[]) {
         std::string ip = NetworkManager::getLocalIP();
 
         printf("\x1b[1;35m====================================================\x1b[0m\n");
-        printf("\x1b[1;37m                   LLAMANX v1.1.5                   \x1b[0m\n");
+        printf("\x1b[1;37m                   LLAMANX v1.1.6                   \x1b[0m\n");
         printf("\x1b[2;37m      Forked from ChatNX by Souldbminer             \x1b[0m\n");
         printf("\x1b[1;35m====================================================\x1b[0m\n\n");
         printf("Available App Heap: \x1b[1;32m%llu MB\x1b[0m\n", (unsigned long long)heap_mb);
