@@ -163,34 +163,34 @@ namespace {
 
         void clear() { lines.clear(); scroll = 0; }
 
+        void ensure_line() {
+            if (lines.empty()) {
+                lines.push_back({ "", 0 });
+            }
+        }
+
         void append(const std::string& text) {
-            std::string cur;
-            int cur_len = 0;
+            ensure_line();
             for (size_t i = 0; i < text.size(); ++i) {
                 if (text[i] == '\x1b' && i + 1 < text.size() && text[i+1] == '[') {
                     size_t j = i + 2;
                     while (j < text.size() && text[j] != 'm') ++j;
                     if (j < text.size()) {
-                        cur.append(text, i, j - i + 1);
+                        lines.back().s.append(text, i, j - i + 1);
                         i = j;
                         continue;
                     }
                 }
                 if (text[i] == '\n') {
-                    lines.push_back({ cur, cur_len });
-                    cur.clear();
-                    cur_len = 0;
+                    lines.push_back({ "", 0 });
                 } else {
-                    cur.push_back(text[i]);
-                    cur_len++;
-                    if (cur_len >= 80) {
-                        lines.push_back({ cur, cur_len });
-                        cur.clear();
-                        cur_len = 0;
+                    if (lines.back().len >= 78) {
+                        lines.push_back({ "", 0 });
                     }
+                    lines.back().s.push_back(text[i]);
+                    lines.back().len++;
                 }
             }
-            if (!cur.empty()) lines.push_back({ cur, cur_len });
             to_bottom();
         }
 
@@ -392,7 +392,7 @@ int main(int argc, char* argv[]) {
         std::string ip = NetworkManager::getLocalIP();
 
         printf("\x1b[1;35m====================================================\x1b[0m\n");
-        printf("\x1b[1;37m                   LLAMANX v1.1.6                   \x1b[0m\n");
+        printf("\x1b[1;37m                   LLAMANX v1.1.7                   \x1b[0m\n");
         printf("\x1b[2;37m      Forked from ChatNX by Souldbminer             \x1b[0m\n");
         printf("\x1b[1;35m====================================================\x1b[0m\n\n");
         printf("Available App Heap: \x1b[1;32m%llu MB\x1b[0m\n", (unsigned long long)heap_mb);

@@ -16,6 +16,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <cctype>
 
 #include <ggml.h>
 #include <gguf.h>
@@ -86,6 +87,8 @@ namespace {
             llama_model_free(s_model);
             s_model = nullptr;
         }
+        s_vocab = nullptr;
+        s_cfg.loaded_model_path.clear();
     }
 
     bool load_model_instance(const std::string& path, int n_ctx, int n_threads) {
@@ -129,13 +132,75 @@ namespace {
         s_cfg.loaded_model_path = path;
         s_cfg.n_ctx = n_ctx;
         s_cfg.n_threads = n_threads;
-        printf("\x1b[1;32m[Web Server] Model loaded successfully!\x1b[0m\n\n");
+        printf("\x1b[1;32m[Web Server] Model loaded successfully! Ready for queries.\x1b[0m\n\n");
         consoleUpdate(NULL);
         return true;
     }
 
+    std::string extract_json_field(const std::string& body, const std::string& key) {
+        std::string needle = "\"" + key + "\":";
+        size_t pos = body.find(needle);
+        if (pos == std::string::npos) return "";
+        pos += needle.size();
+        while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\t' || body[pos] == '\r' || body[pos] == '\n')) pos++;
+        if (pos >= body.size() || body[pos] != '"') return "";
+        pos++; // skip opening quote
+        std::string result;
+        bool escape = false;
+        while (pos < body.size()) {
+            char c = body[pos++];
+            if (escape) {
+                if (c == 'n') result += '\n';
+                else if (c == 'r') result += '\r';
+                else if (c == 't') result += '\t';
+                else if (c == '"') result += '"';
+                else if (c == '\\') result += '\\';
+                else result += c;
+                escape = false;
+            } else if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                break;
+            } else {
+                result += c;
+            }
+        }
+        return result;
+    }
+
+    std::string escape_json(const std::string& s) {
+        std::ostringstream o;
+        for (char c : s) {
+            if (c == '"') o << "\\\"";
+            else if (c == '\\') o << "\\\\";
+            else if (c == '\b') o << "\\b";
+            else if (c == '\f') o << "\\f";
+            else if (c == '\n') o << "\\n";
+            else if (c == '\r') o << "\\r";
+            else if (c == '\t') o << "\\t";
+            else if ((unsigned char)c < ' ') o << "\\u" << std::hex << (int)c;
+            else o << c;
+        }
+        return o.str();
+    }
+
+    bool send_all(int sock, const char* data, size_t total) {
+        size_t sent = 0;
+        while (sent < total) {
+            int n = send(sock, data + sent, total - sent, 0);
+            if (n <= 0) return false;
+            sent += n;
+        }
+        return true;
+    }
+
     std::string run_inference(const std::string& user_prompt, int max_tokens, float temp) {
-        if (!s_ctx || !s_vocab) return "No model loaded. Please select and load a model from the web sidebar.";
+        if (!s_model || !s_ctx || !s_vocab) {
+            return "No model loaded. Please select and load a model from the web sidebar.";
+        }
+
+        // Reset KV cache memory so each web query starts fresh
+        llama_memory_clear(llama_get_memory(s_ctx), true);
 
         llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
         llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp));
@@ -178,30 +243,21 @@ namespace {
 
             char buf[256];
             int n = llama_token_to_piece(s_vocab, tok, buf, sizeof(buf), 0, true);
-            if (n > 0) response.append(buf, n);
+            if (n > 0) {
+                response.append(buf, n);
+                printf("%s", std::string(buf, n).c_str());
+                consoleUpdate(NULL);
+            }
 
             llama_batch batch = llama_batch_get_one(&tok, 1);
             if (llama_decode(s_ctx, batch) != 0) break;
         }
 
+        printf("\n");
+        consoleUpdate(NULL);
+
         llama_sampler_free(smpl);
         return response;
-    }
-
-    std::string escape_json(const std::string& s) {
-        std::ostringstream o;
-        for (char c : s) {
-            if (c == '"') o << "\\\"";
-            else if (c == '\\') o << "\\\\";
-            else if (c == '\b') o << "\\b";
-            else if (c == '\f') o << "\\f";
-            else if (c == '\n') o << "\\n";
-            else if (c == '\r') o << "\\r";
-            else if (c == '\t') o << "\\t";
-            else if ((unsigned char)c < ' ') o << "\\u" << std::hex << (int)c;
-            else o << c;
-        }
-        return o.str();
     }
 }
 
@@ -256,6 +312,13 @@ void run_http_server_mode(PadState* pad, const std::string& initial_model, int p
     }
 
     listen(server_fd, 8);
+
+    if (!initial_model.empty() && !s_model) {
+        printf("Auto-loading default model:\n  %s\n", initial_model.c_str());
+        consoleUpdate(NULL);
+        load_model_instance(initial_model, 1024, 3);
+    }
+
     printf("[Ready] Waiting for incoming web connections...\n");
     consoleUpdate(NULL);
 
@@ -273,16 +336,60 @@ void run_http_server_mode(PadState* pad, const std::string& initial_model, int p
         int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &addrlen);
 
         if (client_fd >= 0) {
-            std::vector<char> req_buf(16384);
-            int bytes_read = recv(client_fd, req_buf.data(), req_buf.size() - 1, 0);
-            if (bytes_read > 0) {
-                req_buf[bytes_read] = '\0';
-                std::string req(req_buf.data());
+            // Set client socket to blocking mode with timeout
+            int cflags = fcntl(client_fd, F_GETFL, 0);
+            fcntl(client_fd, F_SETFL, cflags & ~O_NONBLOCK);
 
+            struct timeval tv;
+            tv.tv_sec = 5;
+            tv.tv_usec = 0;
+            setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+            std::string req;
+            char buf[4096];
+            size_t content_length = 0;
+            bool headers_done = false;
+
+            while (true) {
+                int n = recv(client_fd, buf, sizeof(buf) - 1, 0);
+                if (n <= 0) break;
+                req.append(buf, n);
+
+                if (!headers_done) {
+                    size_t hdr_end = req.find("\r\n\r\n");
+                    if (hdr_end != std::string::npos) {
+                        headers_done = true;
+                        std::string lower_req = req.substr(0, hdr_end);
+                        for (auto& ch : lower_req) ch = (char)tolower((unsigned char)ch);
+                        size_t cl_pos = lower_req.find("content-length:");
+                        if (cl_pos != std::string::npos) {
+                            content_length = (size_t)atoi(req.c_str() + cl_pos + 15);
+                        }
+                    }
+                }
+
+                if (headers_done) {
+                    size_t hdr_end = req.find("\r\n\r\n");
+                    if (req.size() >= hdr_end + 4 + content_length) {
+                        break;
+                    }
+                }
+            }
+
+            if (!req.empty()) {
                 std::string res_header;
                 std::string res_body;
 
-                if (req.rfind("GET / ", 0) == 0 || req.rfind("GET /index.html", 0) == 0) {
+                if (req.rfind("OPTIONS ", 0) == 0) {
+                    res_header = "HTTP/1.1 204 No Content\r\n"
+                                 "Access-Control-Allow-Origin: *\r\n"
+                                 "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                                 "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+                                 "Access-Control-Max-Age: 86400\r\n"
+                                 "Connection: close\r\n\r\n";
+                    res_body = "";
+                } else if (req.rfind("GET / ", 0) == 0 || req.rfind("GET /index.html", 0) == 0) {
                     res_body = INDEX_HTML;
                     res_header = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
                 } else if (req.rfind("GET /api/status", 0) == 0) {
@@ -296,7 +403,7 @@ void run_http_server_mode(PadState* pad, const std::string& initial_model, int p
                          << "\"used_ram_mb\":" << (used_ram / (1024 * 1024)) << ","
                          << "\"loaded_model\":\"" << escape_json(s_cfg.loaded_model_path) << "\","
                          << "\"models\":[";
-                    
+
                     std::vector<ModelItem> models = get_all_models();
                     for (size_t i = 0; i < models.size(); ++i) {
                         json << "{\"name\":\"" << escape_json(models[i].name) << "\","
@@ -312,17 +419,10 @@ void run_http_server_mode(PadState* pad, const std::string& initial_model, int p
                     size_t body_pos = req.find("\r\n\r\n");
                     std::string body = (body_pos != std::string::npos) ? req.substr(body_pos + 4) : "";
 
-                    std::string target_model;
+                    std::string target_model = extract_json_field(body, "model");
                     int n_ctx = s_cfg.n_ctx;
                     int th = s_cfg.n_threads;
 
-                    size_t m_pos = body.find("\"model\":\"");
-                    if (m_pos != std::string::npos) {
-                        size_t m_end = body.find("\"", m_pos + 9);
-                        if (m_end != std::string::npos) {
-                            target_model = body.substr(m_pos + 9, m_end - (m_pos + 9));
-                        }
-                    }
                     size_t c_pos = body.find("\"n_ctx\":");
                     if (c_pos != std::string::npos) n_ctx = atoi(body.c_str() + c_pos + 8);
                     size_t t_pos = body.find("\"threads\":");
@@ -339,17 +439,13 @@ void run_http_server_mode(PadState* pad, const std::string& initial_model, int p
                     size_t body_pos = req.find("\r\n\r\n");
                     std::string body = (body_pos != std::string::npos) ? req.substr(body_pos + 4) : "";
 
-                    std::string prompt = "Hello";
-                    size_t c_pos = body.find("\"content\":");
-                    if (c_pos != std::string::npos) {
-                        size_t start = body.find("\"", c_pos + 10);
-                        if (start != std::string::npos) {
-                            size_t end = body.find("\"", start + 1);
-                            if (end != std::string::npos) prompt = body.substr(start + 1, end - start - 1);
-                        }
+                    std::string prompt = extract_json_field(body, "content");
+                    if (prompt.empty()) {
+                        prompt = extract_json_field(body, "prompt");
                     }
+                    if (prompt.empty()) prompt = "Hello";
 
-                    printf("[Web] Prompt: %s\n", prompt.c_str());
+                    printf("\x1b[1;33m[Web User]\x1b[0m %s\n\x1b[1;36m[AI Response]\x1b[0m ", prompt.c_str());
                     consoleUpdate(NULL);
 
                     std::string answer = run_inference(prompt, s_cfg.n_predict, s_cfg.temp);
@@ -367,11 +463,11 @@ void run_http_server_mode(PadState* pad, const std::string& initial_model, int p
                     res_header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
                 } else {
                     res_body = "{\"status\":\"ok\",\"service\":\"LlamaNX\"}";
-                    res_header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+                    res_header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
                 }
 
-                send(client_fd, res_header.c_str(), res_header.size(), 0);
-                send(client_fd, res_body.c_str(), res_body.size(), 0);
+                send_all(client_fd, res_header.c_str(), res_header.size());
+                send_all(client_fd, res_body.c_str(), res_body.size());
             }
             close(client_fd);
         }
@@ -382,6 +478,6 @@ void run_http_server_mode(PadState* pad, const std::string& initial_model, int p
 
     free_current_model();
     close(server_fd);
-    printf("[Web Server] Stopped.\n");
-    consoleUpdate(NULL);
+    NetworkManager::exit();
+    consoleClear();
 }
